@@ -1,0 +1,7 @@
+{
+  "name": "No-Wait Clinics Architect Dashboard",
+  "description": "A comprehensive lead architect dashboard for a revolutionary queue management system, featuring schema visualization, real-time logic simulators, and low-literacy patient interface concepts.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
