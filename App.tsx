@@ -1,6 +1,7 @@
 
 import React, { useState, useEffect, createContext, useContext } from 'react';
-import { Layout, Database, Activity, FileText, Smartphone, Settings, Mic, ClipboardList, ShieldCheck, UserCircle, Stethoscope, UserPlus } from 'lucide-react';
+import { Layout, Database, Activity, FileText, Smartphone, Settings, Mic, ClipboardList, ShieldCheck, UserCircle, Stethoscope, UserPlus, ShoppingBag, Rocket, BadgeHelp, Wallet, LogOut } from 'lucide-react';
+import LandingPage from './components/LandingPage';
 import SchemaVisualization from './components/SchemaVisualization';
 import QueueSimulator from './components/QueueSimulator';
 import ArchitectsBrief from './components/ArchitectsBrief';
@@ -9,10 +10,21 @@ import VoiceInteractionSystem from './components/VoiceInteractionSystem';
 import ReceptionistDashboard from './components/ReceptionistDashboard';
 import SystemsReliability from './components/SystemsReliability';
 import DoctorConsole from './components/DoctorConsole';
-import { generateStatusAudio } from './services/geminiTTS';
+import DoctorPracticeSetup from './components/DoctorPracticeSetup';
+import SellerDashboard from './components/SellerDashboard';
 
-// --- Shared Types & Context ---
-export type PatientStatus = 'WAITING' | 'TIME_TO_MOVE' | 'ARRIVED' | 'IN_SESSION' | 'COMPLETED' | 'EMERGENCY' | 'CANCELLED';
+// --- Shared Types ---
+export type SubscriptionTier = 'BRONZE' | 'SILVER' | 'GOLD';
+export type Role = 'ADMIN' | 'RECEPTIONIST' | 'DOCTOR' | 'PATIENT' | 'SELLER' | 'UNSET';
+export type PatientStatus = 'PENDING' | 'WAITING' | 'TIME_TO_MOVE' | 'ARRIVED' | 'IN_SESSION' | 'COMPLETED' | 'EMERGENCY' | 'CANCELLED' | 'SKIPPED';
+
+export interface Location {
+  id: string;
+  name: string;
+  fee: number;
+  days: string[];
+  slots: { start: string; end: string; maxOPD: number }[];
+}
 
 export interface Patient {
   id: string;
@@ -22,17 +34,42 @@ export interface Patient {
   paid: boolean;
   name?: string;
   isEmergency?: boolean;
+  locationId?: string;
+  isPriority?: boolean;
+  notes?: string;
+  completedAt?: string;
+}
+
+interface DoctorProfile {
+  name: string;
+  specialty: string;
 }
 
 interface ClinicContextType {
+  role: Role;
+  setRole: (r: Role) => void;
+  tier: SubscriptionTier;
+  setTier: (t: SubscriptionTier) => void;
+  locations: Location[];
+  setLocations: (locs: Location[]) => void;
   queue: Patient[];
+  pendingBookings: Patient[];
+  completedHistory: Patient[];
   currentInSession: Patient | null;
-  addPatient: (phone: string, name?: string, isEmergency?: boolean) => void;
+  walletBalance: number;
+  setWalletBalance: (b: number) => void;
+  addPatient: (phone: string, name?: string, isEmergency?: boolean, locationId?: string, isPriority?: boolean) => void;
+  approveBooking: (id: string) => void;
   updatePatient: (id: string, updates: Partial<Patient>) => void;
   callNext: () => void;
-  completeSession: () => void;
-  triggerEmergency: () => void;
+  completeSession: (notes?: string) => void;
+  markAsSkipped: (id: string) => void;
   isDoctorLate: boolean;
+  isSubscribed: boolean;
+  setSubscribed: (val: boolean) => void;
+  triggerEmergency: () => void;
+  doctorProfile: DoctorProfile;
+  setDoctorProfile: (p: DoctorProfile) => void;
 }
 
 const ClinicContext = createContext<ClinicContextType | undefined>(undefined);
@@ -43,66 +80,54 @@ export const useClinic = () => {
   return context;
 };
 
-// --- Audio Decoding Helpers ---
-const decode = (base64: string) => {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-};
-
-const decodeAudioData = async (
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number,
-): Promise<AudioBuffer> => {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
-};
-
-// --- Main App Component ---
-const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'brief' | 'schema' | 'simulator' | 'patient' | 'reception' | 'doctor' | 'systems' | 'voice'>('brief');
-  const [role, setRole] = useState<'ADMIN' | 'RECEPTIONIST' | 'DOCTOR' | 'PATIENT'>('ADMIN');
-  
-  const [queue, setQueue] = useState<Patient[]>([
-    { id: 'p1', token: 1, phone: '03001112233', status: 'WAITING', paid: true, name: 'Ahmad' },
-    { id: 'p2', token: 2, phone: '03215554444', status: 'WAITING', paid: false, name: 'Fatima' },
-  ]);
+export const App: React.FC = () => {
+  const [role, setRole] = useState<Role>('UNSET');
+  const [activeTab, setActiveTab] = useState<string>('discovery');
+  const [tier, setTier] = useState<SubscriptionTier>('GOLD');
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [queue, setQueue] = useState<Patient[]>([]);
+  const [pendingBookings, setPendingBookings] = useState<Patient[]>([]);
+  const [completedHistory, setCompletedHistory] = useState<Patient[]>([]);
   const [currentInSession, setCurrentInSession] = useState<Patient | null>(null);
+  const [walletBalance, setWalletBalance] = useState(2450); 
   const [isDoctorLate, setIsDoctorLate] = useState(false);
+  const [isSubscribed, setIsSubscribed] = useState(false);
+  const [doctorProfile, setDoctorProfile] = useState<DoctorProfile>({ name: 'Zain', specialty: 'General Surgeon' });
 
-  // Business Logic
-  const addPatient = (phone: string, name?: string, isEmergency: boolean = false) => {
-    const nextToken = isEmergency ? 99 : (queue.length > 0 ? Math.max(...queue.map(p => p.token)) + 1 : 1);
+  useEffect(() => {
+    if (role === 'PATIENT') setActiveTab('discovery');
+    if (role === 'DOCTOR') setActiveTab('setup');
+    if (role === 'SELLER') setActiveTab('seller');
+    if (role === 'ADMIN') setActiveTab('schema');
+    if (role === 'RECEPTIONIST') setActiveTab('reception');
+  }, [role]);
+
+  const addPatient = (phone: string, name?: string, isEmergency = false, locationId?: string, isPriority = false) => {
+    const nextToken = (queue.length + pendingBookings.length + 1);
     const newPatient: Patient = {
       id: Math.random().toString(36).substr(2, 9),
       token: nextToken,
       phone,
-      name: name || (isEmergency ? 'EMERGENCY CASE' : `Patient ${nextToken}`),
-      status: isEmergency ? 'EMERGENCY' : 'WAITING',
+      name: name || (isEmergency ? 'EMERGENCY' : `Patient ${nextToken}`),
+      status: isEmergency ? 'EMERGENCY' : 'PENDING',
       paid: isEmergency,
-      isEmergency
+      isEmergency,
+      locationId,
+      isPriority
     };
 
-    if (isEmergency) {
+    if (isEmergency || (isPriority && tier === 'GOLD')) {
       setQueue(prev => [newPatient, ...prev]);
-      playVoice("Maazrat, ek emergency ki wajah se takheer hogi."); // Delay apology
     } else {
-      setQueue(prev => [...prev, newPatient]);
+      setPendingBookings(prev => [...prev, newPatient]);
+    }
+  };
+
+  const approveBooking = (id: string) => {
+    const p = pendingBookings.find(x => x.id === id);
+    if (p) {
+      setPendingBookings(prev => prev.filter(x => x.id !== id));
+      setQueue(prev => [...prev, { ...p, status: 'WAITING' }]);
     }
   };
 
@@ -110,135 +135,100 @@ const App: React.FC = () => {
     setQueue(prev => prev.map(p => (p.id === id ? { ...p, ...updates } : p)));
   };
 
-  const playVoice = async (text: string) => {
-    const base64 = await generateStatusAudio(text);
-    if (base64) {
-      try {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-        const audioBuffer = await decodeAudioData(decode(base64), audioContext, 24000, 1);
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        source.start();
-      } catch (err) {
-        console.error("Audio failure:", err);
-      }
-    }
-  };
-
-  const triggerEmergency = () => {
-    addPatient("0000000000", "Critical Patient", true);
-  };
-
   const callNext = () => {
-    // Priority: Emergency > Arrived/Paid
-    const next = queue.find(p => p.status === 'EMERGENCY') || 
-                 queue.find(p => p.paid && (p.status === 'ARRIVED' || p.status === 'WAITING' || p.status === 'TIME_TO_MOVE'));
-    
+    const next = queue.find(p => p.status === 'EMERGENCY') || queue.find(p => p.status === 'WAITING' || p.status === 'ARRIVED');
     if (!next) return;
-
     if (currentInSession) {
-      updatePatient(currentInSession.id, { status: 'COMPLETED' });
+        completeSession("Quick completion.");
     }
-
     updatePatient(next.id, { status: 'IN_SESSION' });
     setCurrentInSession(next);
-    playVoice(`Token number ${next.token}, please enter the room.`);
   };
 
-  const completeSession = () => {
+  const completeSession = (notes?: string) => {
     if (currentInSession) {
-      updatePatient(currentInSession.id, { status: 'COMPLETED' });
+      const finishedPatient: Patient = { 
+        ...currentInSession, 
+        status: 'COMPLETED', 
+        notes, 
+        completedAt: new Date().toLocaleTimeString() 
+      };
+      setCompletedHistory(prev => [finishedPatient, ...prev]);
+      setQueue(prev => prev.filter(p => p.id !== currentInSession.id));
       setCurrentInSession(null);
     }
   };
 
-  // Travel Trigger Logic & Late Doctor Simulator
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (!currentInSession && queue.length > 0) {
-        setIsDoctorLate(true);
-      }
-    }, 10000); // Simulate 10 seconds delay as "Doctor is Late"
-
-    if (currentInSession) {
-      setIsDoctorLate(false);
-      const sessionToken = currentInSession.token;
-      setQueue(prev => prev.map(p => {
-        if (p.status === 'WAITING' && p.token <= sessionToken + 5 && p.token > sessionToken) {
-          return { ...p, status: 'TIME_TO_MOVE' };
-        }
-        return p;
-      }));
+  const markAsSkipped = (id: string) => {
+    const p = queue.find(x => x.id === id);
+    if (p) {
+      const skippedPatient: Patient = { ...p, status: 'SKIPPED', completedAt: new Date().toLocaleTimeString() };
+      setCompletedHistory(prev => [skippedPatient, ...prev]);
+      setQueue(prev => prev.filter(x => x.id !== id));
+      if (currentInSession?.id === id) setCurrentInSession(null);
     }
-    return () => clearTimeout(timer);
-  }, [currentInSession, queue]);
+  };
+
+  const triggerEmergency = () => addPatient("EMERGENCY", "EMERGENCY CASE", true);
+
+  if (role === 'UNSET') return <LandingPage onSelect={setRole} />;
 
   return (
-    <ClinicContext.Provider value={{ queue, currentInSession, addPatient, updatePatient, callNext, completeSession, triggerEmergency, isDoctorLate }}>
-      <div className="min-h-screen flex flex-col md:flex-row bg-slate-950 text-slate-100 font-sans selection:bg-emerald-500/30">
+    <ClinicContext.Provider value={{ 
+      role, setRole, tier, setTier, locations, setLocations, queue, pendingBookings, completedHistory,
+      currentInSession, walletBalance, setWalletBalance, addPatient, approveBooking, 
+      updatePatient, callNext, completeSession, markAsSkipped, isDoctorLate, isSubscribed, setSubscribed: setIsSubscribed, 
+      triggerEmergency, doctorProfile, setDoctorProfile 
+    }}>
+      <div className="min-h-screen flex flex-col md:flex-row bg-[#020617] text-slate-100 font-sans">
         
-        <aside className="w-full md:w-72 bg-slate-900 border-r border-slate-800 flex flex-col sticky top-0 h-auto md:h-screen z-50">
-          <div className="p-8">
-            <h1 className="text-2xl font-black bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent tracking-tighter">
-              NO-WAIT CLINICS
-            </h1>
-            <p className="text-[10px] text-slate-500 mt-2 uppercase tracking-[0.3em] font-black">Architecture & App Hub</p>
-          </div>
-
-          <div className="px-6 mb-8">
-            <div className="bg-slate-950 rounded-2xl p-2 border border-slate-800 flex gap-1">
-              {(['ADMIN', 'RECEPTIONIST', 'DOCTOR', 'PATIENT'] as const).map(r => (
-                <button
-                  key={r}
-                  onClick={() => { 
-                    setRole(r); 
-                    const targetTab = r === 'ADMIN' ? 'brief' : r === 'RECEPTIONIST' ? 'reception' : r === 'DOCTOR' ? 'doctor' : 'patient';
-                    setActiveTab(targetTab as any); 
-                  }}
-                  className={`flex-1 py-2 rounded-xl text-[10px] font-black transition-all ${role === r ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/20' : 'text-slate-500 hover:text-slate-300'}`}
-                >
-                  {r[0]}
-                </button>
-              ))}
+        <aside className="w-full md:w-[260px] bg-[#020617] border-b md:border-b-0 md:border-r border-slate-900 flex flex-col sticky top-0 h-auto md:h-screen z-50 shrink-0">
+          <div className="p-5 md:p-8 space-y-6">
+            <div className="w-[180px] h-[40px] bg-gradient-to-r from-[#22d3ee] to-[#34d399] rounded-[4px] shadow-lg shadow-cyan-500/10"></div>
+            <div>
+              <p className="text-[10px] md:text-[11px] text-slate-500 uppercase tracking-[0.4em] font-black">{role} PORTAL</p>
             </div>
           </div>
 
-          <nav className="flex-1 px-4 space-y-1 overflow-y-auto custom-scrollbar">
-            <NavItem icon={<FileText size={18}/>} label="Architect's Brief" active={activeTab === 'brief'} onClick={() => setActiveTab('brief')} />
-            <NavItem icon={<Database size={18}/>} label="Cloud Schema" active={activeTab === 'schema'} onClick={() => setActiveTab('schema')} />
-            <NavItem icon={<Activity size={18}/>} label="Logic Simulator" active={activeTab === 'simulator'} onClick={() => setActiveTab('simulator')} />
-            
-            <div className="py-4 px-4"><div className="h-px bg-slate-800 w-full" /></div>
-            
-            <NavItem icon={<ClipboardList size={18}/>} label="Reception Desk" active={activeTab === 'reception'} onClick={() => setActiveTab('reception')} color="cyan" />
-            <NavItem icon={<Stethoscope size={18}/>} label="Doctor Console" active={activeTab === 'doctor'} onClick={() => setActiveTab('doctor')} color="emerald" />
-            <NavItem icon={<Smartphone size={18}/>} label="Patient App" active={activeTab === 'patient'} onClick={() => setActiveTab('patient')} color="blue" />
-            
-            <div className="py-4 px-4"><div className="h-px bg-slate-800 w-full" /></div>
-            
-            <NavItem icon={<Mic size={18}/>} label="AI Voice System" active={activeTab === 'voice'} onClick={() => setActiveTab('voice')} />
-            <NavItem icon={<ShieldCheck size={18}/>} label="Reliability & QA" active={activeTab === 'systems'} onClick={() => setActiveTab('systems')} />
+          <nav className="flex md:flex-col overflow-x-auto md:overflow-x-visible px-4 space-x-2 md:space-x-0 md:space-y-2 pt-2 pb-4 md:pb-0 scrollbar-hide">
+             {role === 'PATIENT' && <NavItem icon={<ShoppingBag size={18}/>} label="MARKET" active={activeTab === 'discovery'} onClick={() => setActiveTab('discovery')} />}
+             {role === 'DOCTOR' && (
+               <>
+                 <NavItem icon={<Rocket size={18}/>} label="SET UP" active={activeTab === 'setup'} onClick={() => setActiveTab('setup')} />
+                 <NavItem icon={<Stethoscope size={18}/>} label="STATION" active={activeTab === 'doctor'} onClick={() => setActiveTab('doctor')} />
+                 <NavItem icon={<UserPlus size={18}/>} label="STAFF" active={activeTab === 'reception'} onClick={() => setActiveTab('reception')} />
+               </>
+             )}
+             {role === 'RECEPTIONIST' && <NavItem icon={<ClipboardList size={18}/>} label="DESK" active={activeTab === 'reception'} onClick={() => setActiveTab('reception')} />}
+             {role === 'ADMIN' && (
+               <>
+                 <NavItem icon={<Database size={18}/>} label="SCHEMA" active={activeTab === 'schema'} onClick={() => setActiveTab('schema')} />
+                 <NavItem icon={<Activity size={18}/>} label="SIM" active={activeTab === 'simulator'} onClick={() => setActiveTab('simulator')} />
+               </>
+             )}
+             {role === 'SELLER' && (
+               <>
+                 <NavItem icon={<Wallet size={18}/>} label="DASHBOARD" active={activeTab === 'seller'} onClick={() => setActiveTab('seller')} />
+               </>
+             )}
           </nav>
 
-          <div className="p-6 mt-auto border-t border-slate-800 bg-slate-900/50">
-            <div className="flex items-center gap-3 text-slate-500 text-xs font-bold hover:text-slate-300 cursor-pointer transition-colors">
-              <Settings size={16} />
-              <span>System Preferences</span>
-            </div>
+          <div className="mt-auto p-8">
+             <button onClick={() => setRole('UNSET')} className="flex items-center gap-3 text-slate-500 hover:text-white transition-all font-bold uppercase text-[10px] tracking-[0.2em]">
+                <LogOut size={16} /> SWITCH ROLE
+             </button>
           </div>
         </aside>
 
-        <main className="flex-1 overflow-y-auto p-6 md:p-12 relative">
-          <div className="max-w-6xl mx-auto pb-24">
-            {activeTab === 'brief' && <ArchitectsBrief />}
+        <main className="flex-1 overflow-y-auto bg-[#020617]">
+          <div className="max-w-6xl mx-auto p-4 md:p-8 lg:p-10 pb-32">
+            {activeTab === 'discovery' && <PatientUI2026 />}
+            {activeTab === 'setup' && <DoctorPracticeSetup />}
+            {activeTab === 'doctor' && <DoctorConsole />}
+            {activeTab === 'reception' && <ReceptionistDashboard />}
             {activeTab === 'schema' && <SchemaVisualization />}
             {activeTab === 'simulator' && <QueueSimulator />}
-            {activeTab === 'reception' && <ReceptionistDashboard />}
-            {activeTab === 'doctor' && <DoctorConsole />}
-            {activeTab === 'patient' && <PatientUI2026 />}
-            {activeTab === 'voice' && <VoiceInteractionSystem />}
-            {activeTab === 'systems' && <SystemsReliability />}
+            {activeTab === 'seller' && <SellerDashboard />}
           </div>
         </main>
       </div>
@@ -246,24 +236,10 @@ const App: React.FC = () => {
   );
 };
 
-const NavItem = ({ icon, label, active, onClick, color = 'emerald' }: { icon: any, label: string, active: boolean, onClick: () => void, color?: string }) => {
-  const activeClasses = {
-    emerald: 'bg-emerald-500/10 text-emerald-400 ring-1 ring-emerald-500/30',
-    cyan: 'bg-cyan-500/10 text-cyan-400 ring-1 ring-cyan-500/30',
-    blue: 'bg-blue-500/10 text-blue-400 ring-1 ring-blue-500/30',
-  }[color];
-
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-all duration-300 ${
-        active ? activeClasses : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/50'
-      }`}
-    >
-      <span className={active ? '' : 'opacity-50'}>{icon}</span>
-      <span className="font-bold text-sm tracking-tight">{label}</span>
-    </button>
-  );
-};
+const NavItem = ({ icon, label, active, onClick }: any) => (
+  <button onClick={onClick} className={`flex-shrink-0 md:flex-shrink flex items-center gap-3 md:gap-4 px-4 md:px-5 py-2 md:py-3 rounded-full transition-all duration-300 ${active ? `bg-white/10 text-white shadow-xl scale-[1.02]` : 'text-slate-500 hover:text-slate-300'}`}>
+    {icon} <span className="font-black text-[10px] md:text-[11px] tracking-wider whitespace-nowrap uppercase">{label}</span>
+  </button>
+);
 
 export default App;
